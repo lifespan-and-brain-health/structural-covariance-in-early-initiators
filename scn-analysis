@@ -1,0 +1,309 @@
+library(brainGraph)
+library(data.table)
+library(igraph)
+library(ggplot2)
+library(permute)
+library(dplyr)
+
+# Define the main analysis function: Processes data for a given modality (thickness or volume), computes correlations, performs statistical tests (permutations, KS test, bootstrapping), generates plots, and runs graph theory analyses using brainGraph.
+# Inputs:
+# - modality: "thickness" or "volume" (remove if only one required)
+# - density_range: optional vector of densities; if NULL, auto-determines range for fully connected graphs
+# Outputs: group differences in correlation strength and distribution, network differences (mod, Cp, Lp, assort, E.global) between groups, bootstrap results
+
+run_analysis <- function(modality, density_range = NULL) {
+  # Set data directory based on modality
+  if (modality == "thickness") {
+    datadir <- '~/path/to/thickness/data/'
+  } else if (modality == "volume") {
+    datadir <- '~/path/to/volume/data/'
+  } else {
+    stop("Invalid modality specified.")
+  }
+
+  # Load covariate data
+  covars <- fread(file.path(datadir, 'covars.csv'), stringsAsFactors = TRUE)
+  covars[, Study.ID := as.character(Study.ID)]
+  grps <- levels(covars$Group)  # Extract group levels (e.g., "Initiators" and "Controls")
+  # Select modality-specific covariates (mean thickness for thickness, estimated total intracranial volume for volume)
+  if (modality == "thickness") {
+    covars <- covars %>% select(Study.ID, Group, mean_thk) # covariates specific to analysis
+  } else if (modality == "volume") {
+    covars <- covars %>% select(Study.ID, Group, etiv)
+  }
+
+  # Load imaging data using brainGraph's import function
+  raw_data <- import_scn(datadir, atlas = 'dk', modality = modality)
+  invisible(lapply(seq_along(raw_data), function(x) 
+    assign(names(raw_data)[x], raw_data[[x]], envir = .GlobalEnv)))
+  
+  # Compute residuals after regressing out covariates (excluding Group)
+  myResids <- get.resid(lhrh, covars = covars, exclude.cov = 'Group')
+
+  # Calculate correlation strength between groups
+  # First, extract residuals matrix and group labels
+  all_resids <- as.matrix(myResids$resids.all[, .SD, .SDcols = setdiff(names(myResids$resids.all), c('Study.ID', 'Group'))])
+  group_labels <- myResids$resids.all$Group
+  
+  # Split residuals by group
+  initiators_resids <- all_resids[group_labels == grps[1], ]
+  controls_resids <- all_resids[group_labels == grps[2], ]
+  
+  # Compute correlation matrices for each group
+  cor_initiators <- cor(initiators_resids)
+  cor_controls <- cor(controls_resids)
+  
+  # Mean correlation strengths (upper triangle only, excluding diagonal)
+  mean_initiators <- mean(cor_initiators[upper.tri(cor_initiators)])
+  mean_controls <- mean(cor_controls[upper.tri(cor_controls)])
+
+  # Permutation test to determine differences in correlation strength between groups
+  obs_diff <- mean_initiators - mean_controls
+  n_perm <- 1000  # Number of permutations
+  
+  # Generate permutation differences by shuffling labels and recomputing means
+  perm_diffs <- replicate(n_perm, {
+    shuffled_labels <- sample(group_labels)
+    shuffled_init <- all_resids[shuffled_labels == grps[1], ]
+    shuffled_ctrl <- all_resids[shuffled_labels == grps[2], ]
+    cor_shuff_init <- cor(shuffled_init)
+    cor_shuff_ctrl <- cor(shuffled_ctrl)
+    mean(cor_shuff_init[upper.tri(cor_shuff_init)]) - mean(cor_shuff_ctrl[upper.tri(cor_shuff_ctrl)])
+  })
+
+  # Print results to terminal
+  p_value <- mean(abs(perm_diffs) >= abs(obs_diff))  # Two-tailed p-value
+  cat(paste("Modality:", modality, "- Observed difference in mean correlations:", obs_diff, "\n"))
+  cat(paste("Modality:", modality, "- Permutation p-value:", p_value, "\n"))
+
+  # Create and save histogram of permutation distribution (if useful)
+  pdf(paste0("supp_permutation_histogram_", modality, ".pdf"))
+  hist(perm_diffs, main = paste("Permutation Distribution -", modality), xlab = "Difference")
+  abline(v = obs_diff, col = "red", lwd = 2)  # Add line for observed difference
+  dev.off()
+
+  # Run Kolmogorov-Smirnov (KS) test to compare correlation distributions between groups
+  ks_result <- ks.test(cor_initiators[upper.tri(cor_initiators)], cor_controls[upper.tri(cor_controls)])
+  cat(paste("Modality:", modality, "- KS Test Result:\n"))
+  print(ks_result)
+  
+  # Prepare data.frame for plotting correlation densities
+  df <- data.frame(
+    Correlation = c(cor_initiators[upper.tri(cor_initiators)], cor_controls[upper.tri(cor_controls)]),
+    Group = rep(c("Initiators", "Controls"), c(length(cor_initiators[upper.tri(cor_initiators)]), length(cor_controls[upper.tri(cor_controls)])))
+  )
+
+  # Plot and save density distributions of correlations by group
+  p1 <- ggplot(df, aes(x = Correlation, fill = Group)) +
+    geom_density(alpha = 0.5) +
+    labs(title = paste("Density of Correlation Coefficients by Group -", modality),
+         x = "Pearson Correlation", y = "Density") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  ggsave(paste0("density_plot_", modality, ".pdf"), plot = p1, width = 8, height = 6)
+  
+  # Determine candidate densities: Use provided range or default sequence
+  if (!is.null(density_range)) {
+    candidate_densities <- density_range
+  } else {
+    candidate_densities <- seq(0.01, 0.30, 0.01)
+  }
+  
+  # Compute correlation matrices thresholded at candidate densities
+  corrs <- corr.matrix(myResids, densities = candidate_densities)
+  V <- dim(corrs$R)[1]  # Number of vertices (regions)
+  num_groups <- length(grps)
+  
+  # Create brainGraph lists for each density
+  g_all <- lapply(seq_along(candidate_densities), function(x) {
+    A <- array(0, dim = c(V, V, num_groups))
+    for (k in seq_len(num_groups)) {
+      A[, , k] <- corrs$r.thresh[[k]][, , x]
+    }
+    make_brainGraphList(A, atlas = 'dk', modality = modality, weighting = 'pearson',
+                        threshold = candidate_densities[x], level = 'group', gnames = grps)
+  })
+  
+  # Check connectivity across all graphs and densities
+  dt.connected <- data.table(
+    densities = candidate_densities,
+    all_connected = sapply(g_all, function(gl) {
+      all(sapply(gl$graphs, igraph::is_connected))
+    })
+  )
+
+  # If no range provided, find minimum density for full connectivity; extend range if needed
+  if (is.null(density_range)) {
+    min_d <- min(dt.connected[all_connected == TRUE, densities], na.rm = TRUE)
+    if (is.infinite(min_d)) {
+      warning(paste("Modality:", modality, "- No full connectivity up to 0.30, trying up to 0.60"))
+      candidate_densities <- seq(0.01, 0.60, 0.01)
+      corrs <- corr.matrix(myResids, densities = candidate_densities)
+      
+      g_all <- lapply(seq_along(candidate_densities), function(x) {
+        A <- array(0, dim = c(V, V, num_groups))
+        for (k in seq_len(num_groups)) {
+          A[, , k] <- corrs$r.thresh[[k]][, , x]
+        }
+        make_brainGraphList(A, atlas = 'dk', modality = modality, weighting = 'pearson',
+                            threshold = candidate_densities[x], level = 'group', gnames = grps)
+      })
+      
+      dt.connected <- data.table(
+        densities = candidate_densities,
+        all_connected = sapply(g_all, function(gl) {
+          all(sapply(gl$graphs, igraph::is_connected))
+        })
+      )
+      min_d <- min(dt.connected[all_connected == TRUE, densities], na.rm = TRUE)
+      if (is.infinite(min_d)) {
+        stop(paste("Modality:", modality, "- Still no fully connected graphs up to 0.60"))
+      }
+    }
+    cat(paste("Modality:", modality, "- Minimum density for fully connected graphs:", min_d, "\n"))
+    start_idx <- which(candidate_densities == min_d)
+  } else {
+    cat(paste("Modality:", modality, "- Using fixed density range:", paste(range(density_range), collapse = " - "), "\n"))
+    start_idx = 1
+    min_d <- min(dt.connected[all_connected == TRUE, densities], na.rm = TRUE)  # Calculate min_d even when range provided
+    if (is.infinite(min_d)) {
+      warning(paste("Modality:", modality, "- No full connectivity in provided range. Extend the range."))
+    } else {
+      cat(paste("Modality:", modality, "- Minimum density for fully connected graphs in provided range:", min_d, "\n"))
+    }
+  }
+  
+  # Select densities and graphs starting from minimum connected density
+  end_idx <- length(candidate_densities)
+  densities <<- candidate_densities[start_idx:end_idx]
+  g <<- g_all[start_idx:end_idx]
+  
+  # Perform AUC-based permutation testing
+  kNumPerms.auc <- 1e3  # Number of permutations for AUC
+  myPerms.auc <- permute::shuffleSet(n = nobs(myResids), nset = kNumPerms.auc)
+  perms.all.auc <- brainGraph_permute(densities, resids = myResids, perms = myPerms.auc,
+                                      level = 'graph', auc = TRUE)
+
+  # Add per-density permutation testing (if required)
+  kNumPerms <- 1e3  # Number of permutations per density
+  myPerms <- permute::shuffleSet(n = nobs(myResids), nset = kNumPerms)
+  perms.all <- brainGraph_permute(densities, myResids, perms=myPerms,
+                                  level='graph')
+  
+  # For each measure, print summary and save permutation plot
+  measures <- c("mod", "Cp", "Lp", "assort", "E.global")
+  
+  for (measure in measures) {
+    cat(paste("Modality:", modality, "- Summary for", measure, ":\n"))
+    print(summary(perms.all, measure = measure, alt='two.sided'))
+    
+    permPlot <- plot(perms.all, measure=measure, alt='two.sided')
+    pdf(paste0("perm_plot_", measure, "_", modality, ".pdf"))
+    print(permPlot)
+    dev.off()
+  }
+  
+  # Add bootstrapping for each measure to estimate variability
+  kNumBoot <- 1e3  # Number of bootstrap resamples
+  for (measure in measures) {
+    boot_res <- brainGraph_boot(densities, myResids, R=kNumBoot, measure=measure, .progress=FALSE)
+    print(summary(boot_res))
+    
+    # Plot and save bootstrap SE and CI
+    boot_p <- plot(boot_res)
+    p1 <- boot_p$se + theme(legend.position="none", axis.title.x = element_blank(),
+                            axis.title.y = element_blank())
+    p2 <- boot_p$ci + theme(legend.position="none", axis.title.x = element_blank(),
+                            axis.title.y = element_blank())
+    plot_res <- gridExtra::grid.arrange(p1, p2, ncol = 2)
+    
+    ggsave(paste0('~/path/to/results/', modality, 'bootstrap/', measure, '.png'), plot_res, width = 1750, height = 750, units = "px", dpi = 300)
+  }
+  
+  # Return key outputs for further processing
+  return(list(perms = perms.all.auc, densities = densities, g = g, perms_per_density = perms.all))
+}
+
+# brainGraph base code does not provide values for non-significant results - this function computes AUC for graph measures, then derives permutation-based stats (differences, CI, p-values) for all results
+# Inputs: 
+# - perms: Permutation object from brainGraph (contains observed diffs and perm diffs in DT)
+# - g: List of graph lists (each with case/control graphs across densities)
+# - densities: Vector of density values for AUC integration
+compute_results <- function(perms, g, densities) {
+  # Define the graph theory measures to analyze (modularity, clustering coeff, path length, assortativity, global efficiency)
+  measures <- c("mod", "Cp", "Lp", "assort", "E.global")
+  
+  # Extract observed metric values for the case group (group 1) across all densities
+  obs_case <- sapply(g, function(gl) {
+    gr <- gl$graphs[[1]]
+    c(mod = gr$mod, Cp = gr$Cp, Lp = gr$Lp, assort = gr$assort, E.global = gr$E.global)
+  })
+  
+  # Extract observed metric values for the control group (group 2) across all densities
+  obs_control <- sapply(g, function(gl) {
+    gr <- gl$graphs[[2]]
+    c(mod = gr$mod, Cp = gr$Cp, Lp = gr$Lp, assort = gr$assort, E.global = gr$E.global)
+  })
+  
+  # Helper function to compute Area Under the Curve (AUC) via trapezoidal integration over densities
+  auc_fun <- function(vals, dens) {
+    sum(diff(dens) * (head(vals, -1) + tail(vals, -1)) / 2)
+  }
+  
+  # Compute AUC for each measure in the case group
+  auc_case <- apply(obs_case, 1, auc_fun, dens = densities)
+  names(auc_case) <- measures
+  
+  # Compute AUC for each measure in the control group
+  auc_control <- apply(obs_control, 1, auc_fun, dens = densities)
+  names(auc_control) <- measures
+  
+  # Initialize a data.table to store results: AUC per group, plus placeholders for permutation stats
+  results <- data.table(
+    densities = rep(1, length(measures)),  # Placeholder; could represent integrated density if needed
+    region = rep("graph", length(measures)),  # Indicates whole-graph level (vs. regional)
+    measure = measures,
+    case = as.numeric(auc_case),
+    control = as.numeric(auc_control),
+    obs.diff = NA_real_,
+    perm.diff = NA_real_,
+    `95% CI low` = NA_real_,
+    `95% CI high` = NA_real_,
+    p = NA_real_
+  )
+  
+  # Loop over each measure to compute and fill in permutation-based statistics
+  for (i in seq_along(measures)) {
+    meas <- measures[i]
+    # Get permutation differences for this measure
+    perm_diffs <- perms$DT[, get(meas)]
+    # Get observed difference for this measure
+    obs_d <- perms$obs.diff[[meas]]
+    # Median of permutation differences (null distribution median)
+    perm_med <- median(perm_diffs)
+    # P-value: proportion of perm diffs at least as extreme as observed (two-tailed)
+    p_val <- mean(abs(perm_diffs) >= abs(obs_d))
+    # 95% CI from permutation distribution quantiles
+    ci <- quantile(perm_diffs, c(0.025, 0.975))
+    
+    results[i, obs.diff := obs_d]
+    results[i, perm.diff := perm_med]
+    results[i, `95% CI low` := ci[1]]
+    results[i, `95% CI high` := ci[2]]
+    results[i, p := p_val]
+  }
+  
+  return(results)
+}
+
+# Run analysis for thickness modality and compute results
+thickness_output <- run_analysis("thickness")
+
+results_thickness <- compute_results(thickness_output$perms, thickness_output$g, thickness_output$densities)
+print(results_thickness)
+
+# Run analysis for volume modality and compute results
+volume_output <- run_analysis("volume")
+
+results_volume <- compute_results(volume_output$perms, volume_output$g, volume_output$densities)
+print(results_volume)
